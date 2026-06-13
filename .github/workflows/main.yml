@@ -33,7 +33,6 @@ jobs:
 
       - name: 安装 Android SDK 35 和 NDK r28b
         run: |
-          # sdkmanager 需要 Java 17，默认的 Java 11 会报 UnsupportedClassVersionError
           export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
           export PATH=$JAVA_HOME/bin:$PATH
 
@@ -80,26 +79,37 @@ jobs:
             --define MEDIAPIPE_DISABLE_OPENCV=1 \
             --linkopt=-s \
             //mediapipe/tasks/java/com/google/mediapipe/tasks/vision:tasks_vision
+          echo "bazel-bin 真实路径: $(readlink -f bazel-bin)"
         timeout-minutes: 120
 
       - name: 收集产物 + 导出符号清单
         run: |
           mkdir -p output
 
-          echo "=== bazel-bin 下所有 .so ==="
-          find mediapipe/bazel-bin -name "*.so" 2>/dev/null | sort
+          BAZEL_BIN=$(readlink -f mediapipe/bazel-bin)
+          echo "实际 bazel-bin 路径: $BAZEL_BIN"
 
-          echo "=== 复制目标文件 ==="
-          find mediapipe/bazel-bin -name "libmediapipe_tasks_vision_jni.so" \
+          echo "=== 所有 .so ==="
+          find -L "$BAZEL_BIN" -name "*.so" 2>/dev/null | sort
+
+          echo "=== 所有 .aar ==="
+          find -L "$BAZEL_BIN" -name "*.aar" 2>/dev/null | sort
+
+          echo "=== 直接复制 .so ==="
+          find -L "$BAZEL_BIN" -name "libmediapipe_tasks_vision_jni.so" \
             -exec cp {} output/ \; -print
 
-          # 万一目标名不同，把所有 arm64 的 .so 一起捞
-          if [ -z "$(ls output/*.so 2>/dev/null)" ]; then
-            echo "未找到 libmediapipe_tasks_vision_jni.so，复制所有 arm64 .so"
-            find mediapipe/bazel-bin -name "*.so" \
-              ! -name "*.runfiles" \
-              -exec cp {} output/ \; 2>/dev/null || true
-          fi
+          echo "=== 从 AAR 提取 .so ==="
+          find -L "$BAZEL_BIN" -name "*.aar" | while read aar; do
+            echo "处理: $aar"
+            tmpdir=$(mktemp -d)
+            unzip -q "$aar" -d "$tmpdir"
+            find "$tmpdir" -name "*.so" | while read f; do
+              echo "  提取: $f"
+              cp "$f" output/
+            done
+            rm -rf "$tmpdir"
+          done
 
           echo "=== output 目录内容 ==="
           ls -lh output/ || echo "(空)"
