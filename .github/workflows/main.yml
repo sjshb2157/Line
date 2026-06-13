@@ -85,21 +85,36 @@ jobs:
       - name: 收集产物 + 导出符号清单
         run: |
           mkdir -p output
-          find mediapipe/bazel-bin -name "libmediapipe_tasks_vision_jni.so" | while read f; do
-            echo "找到: $f"
-            cp "$f" output/
-          done
-          find mediapipe/bazel-bin -name "*.so" -exec ls -lh {} \;
 
+          echo "=== bazel-bin 下所有 .so ==="
+          find mediapipe/bazel-bin -name "*.so" 2>/dev/null | sort
+
+          echo "=== 复制目标文件 ==="
+          find mediapipe/bazel-bin -name "libmediapipe_tasks_vision_jni.so" \
+            -exec cp {} output/ \; -print
+
+          # 万一目标名不同，把所有 arm64 的 .so 一起捞
+          if [ -z "$(ls output/*.so 2>/dev/null)" ]; then
+            echo "未找到 libmediapipe_tasks_vision_jni.so，复制所有 arm64 .so"
+            find mediapipe/bazel-bin -name "*.so" \
+              ! -name "*.runfiles" \
+              -exec cp {} output/ \; 2>/dev/null || true
+          fi
+
+          echo "=== output 目录内容 ==="
+          ls -lh output/ || echo "(空)"
+
+          echo "=== 符号分析 ==="
           for f in output/*.so; do
-            echo "===== $f ====="
+            [ -f "$f" ] || continue
+            echo "--- $f ---"
             file "$f"
-            readelf -d "$f" | grep NEEDED
-            nm -D --defined-only "$f" | grep "Java_" | awk '{print $NF}' | sort -u \
-              > "${f}.symbols.txt"
+            readelf -d "$f" 2>/dev/null | grep NEEDED || true
+            nm -D --defined-only "$f" 2>/dev/null \
+              | grep "Java_" | awk '{print $NF}' | sort -u \
+              > "${f}.symbols.txt" || true
             echo "导出 Java_ 符号数: $(wc -l < ${f}.symbols.txt)"
           done
-          ls -lh output/
 
       - name: 上传产物
         uses: actions/upload-artifact@v4
