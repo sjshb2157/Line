@@ -1,1 +1,113 @@
+name: Build MediaPipe SO
 
+on:
+  workflow_dispatch:
+    inputs:
+      mediapipe_version:
+        description: 'MediaPipe 版本 tag (原库版本反推不出，先用最新；编完用符号 diff 校验)'
+        required: true
+        default: 'v0.10.35'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: 安装依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 python3-pip git unzip curl wget \
+            openjdk-17-jdk build-essential binutils
+          # MediaPipe 的 bazel 构建需要 numpy（configure 阶段会用到）
+          python3 -m pip install --user numpy
+
+      - name: 安装 Bazel 6.5.0
+        run: |
+          curl -fsSL https://bazel.build/bazel-release.pub.gpg \
+            | gpg --dearmor > bazel.gpg
+          sudo mv bazel.gpg /etc/apt/trusted.gpg.d/
+          echo "deb [arch=amd64] https://storage.googleapis.com/bazel-apt stable jdk1.8" \
+            | sudo tee /etc/apt/sources.list.d/bazel.list
+          sudo apt-get update && sudo apt-get install -y bazel-6.5.0
+          sudo ln -sf /usr/bin/bazel-6.5.0 /usr/bin/bazel
+          bazel --version
+
+      - name: 安装 Android SDK 35 和 NDK r28b
+        run: |
+          wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          unzip -q commandlinetools-linux-11076708_latest.zip -d cmdtools
+          mkdir -p $HOME/android-sdk/cmdline-tools
+          mv cmdtools/cmdline-tools $HOME/android-sdk/cmdline-tools/latest
+
+          export ANDROID_HOME=$HOME/android-sdk
+          export PATH=$PATH:$ANDROID_HOME/cmdline-tools/latest/bin
+
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          # 官方现在要求 SDK 35+ / NDK 28+；NDK 锁定 r28b 以匹配原库 (build 13356709)
+          sdkmanager \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "ndk;28.1.13356709"
+
+          echo "ANDROID_HOME=$HOME/android-sdk" >> $GITHUB_ENV
+          echo "ANDROID_NDK_HOME=$HOME/android-sdk/ndk/28.1.13356709" >> $GITHUB_ENV
+
+      - name: Clone MediaPipe 源码
+        run: |
+          git clone --depth 1 \
+            --branch ${{ github.event.inputs.mediapipe_version }} \
+            https://github.com/google-ai-edge/mediapipe.git
+
+      - name: 配置 WORKSPACE
+        run: |
+          cd mediapipe
+          # 不写死 path，靠 ANDROID_HOME / ANDROID_NDK_HOME 环境变量解析
+          # api_level=21 匹配原库 minSdk；bind crosstool 这行原 workflow 漏了，缺它会报 @androidndk 找不到
+          cat >> WORKSPACE <<'EOF'
+
+          android_sdk_repository(name = "androidsdk")
+          android_ndk_repository(name = "androidndk", api_level = 21)
+          bind(name = "android/crosstool", actual = "@androidndk//:toolchain")
+          EOF
+
+      - name: 编译 libmediapipe_tasks_vision_jni.so
+        run: |
+          cd mediapipe
+          bazel build -c opt \
+            --config=android_arm64 \
+            --define EXCLUDE_OPENCV_SO_LIB=1 \
+            --define MEDIAPIPE_DISABLE_OPENCV=1 \
+            --linkopt=-s \
+            //mediapipe/tasks/java/com/google/mediapipe/tasks/vision:tasks_vision
+        timeout-minutes: 120
+
+      - name: 收集产物 + 导出符号清单
+        run: |
+          mkdir -p output
+          # 只要 arm64 的 vision jni（原库就只有 arm64-v8a）
+          find mediapipe/bazel-bin -name "libmediapipe_tasks_vision_jni.so" | while read f; do
+            echo "找到: $f"
+            cp "$f" output/
+          done
+          # 顺手找一下其它 so，万一目标产物名不同
+          find mediapipe/bazel-bin -name "*.so" -exec ls -lh {} \;
+
+          # 关键：dump 新库的动态导出符号，方便你本地和原库 diff 校验 ABI
+          for f in output/*.so; do
+            echo "===== $f ====="
+            file "$f"
+            readelf -d "$f" | grep NEEDED
+            nm -D --defined-only "$f" | grep "Java_" | awk '{print $NF}' | sort -u \
+              > "${f}.symbols.txt"
+            echo "导出 Java_ 符号数: $(wc -l < ${f}.symbols.txt)"
+          done
+          ls -lh output/
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: mediapipe-so-${{ github.event.inputs.mediapipe_version }}
+          path: |
+            output/*.so
+            output/*.symbols.txt
+          retention-days: 7
