@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       mediapipe_version:
-        description: 'MediaPipe 版本 tag'
+        description: 'MediaPipe 版本 tag (v0.10.32 是最后一个保留 vision_jni 旧名的版本)'
         required: true
-        default: 'v0.10.35'
+        default: 'v0.10.32'
 
 jobs:
   build:
@@ -70,69 +70,46 @@ jobs:
           bind(name = "android/crosstool", actual = "@androidndk//:toolchain")
           EOF
 
-      - name: 编译 tasks_vision (含 native .so)
+      - name: 编译 libmediapipe_tasks_vision_jni.so
         run: |
           cd mediapipe
-          # 编上层 tasks_vision target；--fat_apk_cpu 显式指定 ABI，确保 dummy app 真正编出 arm64 native
+          # v0.10.32 里这是 mediapipe_jni_binary 生成的 output target，产物直接落地
+          # opencv 两个 define 必须留，否则运行时报 libopencv_java4.so not found
           bazel build -c opt \
             --config=android_arm64 \
-            --fat_apk_cpu=arm64-v8a \
             --define MEDIAPIPE_DISABLE_OPENCV=1 \
             --define EXCLUDE_OPENCV_SO_LIB=1 \
-            //mediapipe/tasks/java/com/google/mediapipe/tasks/vision:tasks_vision
+            //mediapipe/tasks/java/com/google/mediapipe/tasks/vision:libmediapipe_tasks_vision_jni.so
 
-          echo "bazel-bin 真实路径: $(readlink -f bazel-bin)"
+          echo "bazel-bin: $(readlink -f bazel-bin)"
+          ls -lh bazel-bin/mediapipe/tasks/java/com/google/mediapipe/tasks/vision/libmediapipe_tasks_vision_jni.so
         timeout-minutes: 120
 
-      - name: 提取 .so + 校验
+      - name: 收集产物 + 校验
         run: |
           cd mediapipe
           mkdir -p ../output
-
-          echo "=== 全盘列出 dummy apk / aar / so ==="
-          find -L bazel-bin -name "*dummy_app_unsigned.apk" 2>/dev/null | sort
-          find -L bazel-bin -name "tasks_vision*.aar" 2>/dev/null | sort
-          find -L bazel-bin -name "*.so" 2>/dev/null | grep -i vision | sort
-
-          # 来源 1（最可靠）：dummy apk 里的 lib/arm64-v8a/
-          echo "=== 从 dummy apk 提取 ==="
-          APK=$(find -L bazel-bin -name "*tasks_vision*dummy_app_unsigned.apk" 2>/dev/null | head -1)
-          if [ -n "$APK" ]; then
-            echo "apk: $APK"
-            rm -rf apk_x && mkdir apk_x
-            unzip -o "$APK" "lib/*" -d apk_x >/dev/null 2>&1 || true
-            find apk_x -name "*.so" ! -name "*_dummy_app.so" -print \
-              -exec cp {} ../output/ \;
-          else
-            echo "未找到 dummy apk"
+          SO=$(find -L bazel-bin -name "libmediapipe_tasks_vision_jni.so" 2>/dev/null | head -1)
+          if [ -z "$SO" ]; then
+            echo "::error::没找到产物，列出 vision 目录所有 .so："
+            find -L bazel-bin -path "*tasks/vision*" -name "*.so" 2>/dev/null
+            exit 1
           fi
+          echo "产物: $SO"
+          cp "$SO" ../output/
 
-          # 来源 2（备用）：最终 aar 的 jni/
-          echo "=== 从 aar 提取（备用） ==="
-          AAR=$(find -L bazel-bin -name "tasks_vision.aar" 2>/dev/null | head -1)
-          if [ -n "$AAR" ] && [ -z "$(ls ../output/*.so 2>/dev/null)" ]; then
-            rm -rf aar_x && mkdir aar_x
-            unzip -o "$AAR" -d aar_x >/dev/null 2>&1 || true
-            find aar_x -path "*jni*" -name "*.so" -print -exec cp {} ../output/ \;
-          fi
-
-          echo "=== 校验产物 ==="
           cd ../output
-          ls -lh || echo "(空)"
-          for f in *.so; do
-            [ -f "$f" ] || { echo "::error::没提取到任何 .so，请把上面 find 输出贴出来"; exit 1; }
-            echo "----- $f -----"
-            file "$f"
-            echo "[NEEDED 依赖] (应无 opencv / 无 pairipcore):"
-            readelf -d "$f" | grep NEEDED
-            echo "[NDK note]:"
-            readelf -n "$f" 2>/dev/null | grep -iA1 android || true
-            echo "[16K 对齐检查] (应出现 2**14):"
-            readelf -lW "$f" 2>/dev/null | grep LOAD | head -2
-            echo "[导出 Java_ 符号数]:"
-            nm -D --defined-only "$f" 2>/dev/null | grep -c "Java_" || true
-            nm -D --defined-only "$f" 2>/dev/null | grep "Java_" | awk '{print $NF}' | sort -u > "$f.symbols.txt"
-          done
+          f=libmediapipe_tasks_vision_jni.so
+          echo "=== file ===";            file "$f"
+          echo "=== NEEDED (应无 opencv / 无 pairipcore) ==="
+          readelf -d "$f" | grep NEEDED
+          echo "=== NDK note ==="
+          readelf -n "$f" 2>/dev/null | grep -iA1 android || true
+          echo "=== 16K 对齐 (看 Align 列是否 2**14) ==="
+          readelf -lW "$f" 2>/dev/null | grep -E "LOAD" | head -3
+          echo "=== 导出 Java_ 符号 (和原库 diff 用) ==="
+          nm -D --defined-only "$f" | grep "Java_" | awk '{print $NF}' | sort -u > "$f.symbols.txt"
+          echo "符号数: $(wc -l < $f.symbols.txt)"
 
       - name: 上传产物
         uses: actions/upload-artifact@v4
