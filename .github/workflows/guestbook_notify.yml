@@ -1,0 +1,151 @@
+name: 留言提醒
+
+# 轮询留言板的公开接口，发现新留言就开一个 Issue。
+# GitHub 会按你的通知设置把新 Issue 推到邮箱和手机，所以不需要配置
+# 邮件服务、SMTP 授权码或任何额外密钥。
+#
+# 进度不存仓库变量：GITHUB_TOKEN 没有管理 Actions 变量的权限，那条路要
+# 额外配一个 PAT。这里改为从已创建的 Issue 正文里解析已处理过的最大
+# objectId，把 Issue 本身当成状态，零外部依赖。
+#
+# 工作流不依赖所在仓库，放 home 或 sjshb57/Test 都可以，
+# Issue 会开在它所在的那个仓库里。
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+    inputs:
+      backfill_from:
+        description: '从指定 objectId 之后开始补发（留空＝按已有 Issue 自动判断）'
+        required: false
+        default: ''
+
+permissions:
+  issues: write
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 确保标签存在
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh label create 留言 --repo "$GITHUB_REPOSITORY" \
+            --color BFD4F2 --description "留言板新留言" 2>/dev/null || true
+
+      - name: 检查新留言
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          API: https://waline-twitterarchiver.vercel.app/api/comment
+          GUESTBOOK_URL: https://twitterarchiver.github.io/home/guestbook.html
+          BACKFILL_FROM: ${{ inputs.backfill_from }}
+        run: |
+          cat > /tmp/notify.py << 'PYEOF'
+          import html as _html, json, os, re, subprocess, sys, urllib.request
+
+          API   = os.environ["API"]
+          REPO  = os.environ["GITHUB_REPOSITORY"]
+          BOARD = os.environ["GUESTBOOK_URL"]
+          LABEL = "留言"
+          MARK  = "objectId"          # Issue 正文里记录进度的字段
+
+          def gh(*args, check=True):
+              r = subprocess.run(["gh", *args], capture_output=True, text=True)
+              if check and r.returncode != 0:
+                  print(f"::error::gh {' '.join(args)} 失败: {r.stderr.strip()}")
+                  sys.exit(1)
+              return r.stdout.strip()
+
+          def fetch_comments():
+              # 取最近 50 条足够覆盖 15 分钟的增量；真超了也只是漏掉最旧的几条
+              req = urllib.request.Request(f"{API}?type=recent&count=50",
+                                           headers={"User-Agent": "guestbook-notify"})
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  payload = json.load(r)
+              items = payload.get("data", payload)
+              return items if isinstance(items, list) else []
+
+          def oid(c):
+              try:
+                  return int(c.get("objectId", 0))
+              except (TypeError, ValueError):
+                  return 0
+
+          def last_notified_id():
+              """从已有 Issue 正文里取记录过的最大 objectId；一条都没有则返回 None"""
+              raw = gh("issue", "list", "--repo", REPO, "--label", LABEL,
+                       "--state", "all", "--limit", "300", "--json", "body")
+              try:
+                  issues = json.loads(raw or "[]")
+              except json.JSONDecodeError:
+                  return None
+              ids = []
+              for it in issues:
+                  m = re.search(rf"{MARK}: `(\d+)`", it.get("body") or "")
+                  if m:
+                      ids.append(int(m.group(1)))
+              return max(ids) if ids else None
+
+          def plain(s):
+              """comment 是渲染后的 HTML，转成纯文本再放进 Issue"""
+              s = re.sub(r"<br\s*/?>", "\n", s or "")
+              s = re.sub(r"</p\s*>", "\n", s)
+              s = re.sub(r"<[^>]+>", "", s)
+              return _html.unescape(s).strip()
+
+          def make_issue(title, lines):
+              gh("issue", "create", "--repo", REPO, "--label", LABEL,
+                 "--title", title[:120], "--body", "\n".join(lines))
+
+          try:
+              items = [c for c in fetch_comments() if oid(c) > 0]
+          except Exception as e:
+              # Vercel 冷启动偶尔超时，跳过等下一轮即可，不该把工作流标红
+              print(f"::warning::留言接口请求失败，本次跳过: {e}")
+              sys.exit(0)
+
+          if not items:
+              print("留言板还没有内容")
+              sys.exit(0)
+
+          newest = max(oid(c) for c in items)
+
+          override = os.environ.get("BACKFILL_FROM", "").strip()
+          last = int(override) if override.isdigit() else last_notified_id()
+
+          if last is None:
+              # 首次启用只留一条记录进度的 Issue，不把历史留言全部补发一遍
+              make_issue("💬 留言提醒已启用", [
+                  "从现在起，留言板有新留言会自动开 Issue 通知。",
+                  "", "---", f"{MARK}: `{newest}`",
+                  "", f"[打开留言板]({BOARD})",
+              ])
+              print(f"首次启用，记录当前进度 {MARK}={newest}，不补发历史留言")
+              sys.exit(0)
+
+          fresh = sorted((c for c in items if oid(c) > last), key=oid)
+          if not fresh:
+              print(f"没有新留言（当前进度 {last}）")
+              sys.exit(0)
+
+          for c in fresh:
+              nick = c.get("nick") or "匿名"
+              body = plain(c.get("comment")) or "(空)"
+              where = c.get("url") or ""
+              # 留言正文用引用块包住，避免其中的 Markdown 或 #123 影响 Issue 排版
+              quoted = "\n".join("> " + ln for ln in body.splitlines())
+              make_issue(f"💬 新留言 · {nick}", [
+                  f"**{nick}** 在 `{where}` 留言：", "",
+                  quoted, "",
+                  "---", f"{MARK}: `{oid(c)}`",
+                  "", f"[打开留言板]({BOARD})",
+              ])
+              print(f"  已创建 Issue: 💬 新留言 · {nick}（{MARK}={oid(c)}）")
+
+          print(f"=== 本次推送 {len(fresh)} 条，进度到 {newest} ===")
+          PYEOF
+          python3 /tmp/notify.py
